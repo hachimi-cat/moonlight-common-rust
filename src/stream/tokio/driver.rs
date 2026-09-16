@@ -22,6 +22,70 @@ pub struct StreamDriver<Stream> {
     recv_buffer: Vec<u8>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    struct TimerProbe {
+        deadline: SansInstant,
+        fired: Option<SansInstant>,
+    }
+
+    impl UdpStream for TimerProbe {
+        type Error = io::Error;
+        type Event = SansInstant;
+        fn pending_send(&self) -> Option<(SocketAddr, &[u8])> {
+            None
+        }
+        fn consume_send(&mut self) {}
+        fn poll_timeout(&self) -> Option<SansInstant> {
+            if self.fired.is_none() {
+                Some(self.deadline)
+            } else {
+                None
+            }
+        }
+        fn poll_event(&mut self) -> Option<Self::Event> {
+            self.fired.take()
+        }
+        fn handle_receive(
+            &mut self,
+            _: SansInstant,
+            _: SocketAddr,
+            _: &[u8],
+        ) -> Result<(), io::Error> {
+            Ok(())
+        }
+        fn handle_timeout(&mut self, now: SansInstant) -> Result<(), io::Error> {
+            // Fail promptly, rather than hanging the test in the pre-fix
+            // busy loop: an elapsed timer must never see time near zero.
+            assert!(
+                now >= self.deadline,
+                "timeout clock moved backwards: {now:?} < {:?}",
+                self.deadline
+            );
+            self.fired = Some(now);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_timeout_uses_the_same_epoch_as_receive_and_deadline() {
+        let mut driver = StreamDriver::new(TimerProbe {
+            deadline: SansInstant::from_nanos(20_000_000),
+            fired: None,
+        })
+        .await
+        .unwrap();
+        let first = driver.drive().await.unwrap();
+        assert!(first >= SansInstant::from_nanos(20_000_000));
+        driver.inner.deadline = first + Duration::from_millis(20);
+        let second = driver.drive().await.unwrap();
+        assert!(second >= first + Duration::from_millis(20));
+    }
+}
+
 impl<Stream> StreamDriver<Stream>
 where
     Stream: UdpStream,
@@ -152,7 +216,11 @@ where
                 if this.sleep.as_mut().poll(cx).is_ready() {
                     this.driver
                         .inner
-                        .handle_timeout(SansInstant::from_std(Instant::now().into_std()))?;
+                        // from_std measures elapsed time FROM its argument;
+                        // passing now resets the protocol clock to ~0 and
+                        // leaves the expired deadline ready forever. Receive,
+                        // deadline conversion and timeout must share an epoch.
+                        .handle_timeout(SansInstant::from_std(this.driver.base_time.into_std()))?;
                     continue;
                 }
             }
