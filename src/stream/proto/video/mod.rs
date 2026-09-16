@@ -38,6 +38,10 @@ pub mod payloader;
 #[allow(clippy::unwrap_used)]
 mod test;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod lifecycle_test;
+
 /// The time window a frame has for all packets to be received
 const FULL_FRAME_RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
 /// A final timeout that is used when nothing happened
@@ -147,9 +151,17 @@ impl VideoStream {
         };
         let highest = self.depayloader.known_frames().max().unwrap_or(current);
 
-        let frame_known = self.depayloader.is_frame_known(FrameIndex(0));
+        let frame_known = self.depayloader.is_frame_known(current);
 
-        let current_frame_first_seen = self.frames_first_seen.get(&current);
+        // A whole lost frame has no entry of its own. A later frame is
+        // evidence of that gap and must start the same bounded loss timer.
+        let current_frame_first_seen = self.frames_first_seen.get(&current).or_else(|| {
+            self.frames_first_seen
+                .iter()
+                .filter(|(index, _)| **index > current)
+                .map(|(_, first_seen)| first_seen)
+                .min()
+        });
 
         // After which time the frame can be seen as lost based on current time
         let current_frame_until_dropped =
@@ -237,6 +249,9 @@ impl VideoStream {
 
             self.current_frame = Some(FrameIndex(frame_index.0 + 1));
 
+            self.frames_first_seen
+                .retain(|index, _| *index > frame_index);
+
             let frame = self
                 .depayloader
                 .take_frame(frame_index)
@@ -284,7 +299,15 @@ impl UdpStream for VideoStream {
     }
 
     fn poll_timeout(&self) -> Option<Instant> {
-        Some(self.last_now + self.wait_until_idr())
+        let mut recovery = self.last_now + self.wait_until_idr();
+        if let Some(last_request) = self.waiting_for_idr_since {
+            recovery = recovery.max(last_request + IDR_REQUEST_TIMEOUT);
+        }
+        self.ping_sender
+            .poll_timeout()
+            .into_iter()
+            .chain(Some(recovery))
+            .min()
     }
 
     fn poll_event(&mut self) -> Option<Self::Event> {

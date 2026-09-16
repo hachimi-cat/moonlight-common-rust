@@ -11,7 +11,7 @@ use sans_io_time::Instant;
 
 use fec_rs::ReedSolomon;
 use thiserror::Error;
-use tracing::{Level, debug, info, instrument, trace};
+use tracing::{Level, debug, info, instrument, trace, warn};
 
 use crate::{
     crypto::disabled::DisabledCryptoBackend,
@@ -38,6 +38,10 @@ pub mod payloader;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, unused)]
 mod test;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod lifecycle_test;
 
 // TODO: this needs to be adjustable based on the audio sample length
 /// The maximum time to wait for a sample
@@ -69,6 +73,7 @@ pub struct AudioStream {
     addr: SocketAddr,
     last_frame: Instant,
     dropped_frames: bool,
+    last_bad_packet_warning: Option<Instant>,
     ping_sender: PingSender,
     depayloader: AudioDepayloader,
     events: VecDeque<AudioStreamEvent>,
@@ -86,7 +91,8 @@ impl AudioStream {
         Self {
             addr: config.addr,
             last_frame: now,
-            dropped_frames: true,
+            dropped_frames: false,
+            last_bad_packet_warning: None,
             ping_sender: PingSender::new(
                 now,
                 PingSenderConfig {
@@ -106,8 +112,27 @@ impl AudioStream {
     }
 
     fn poll_depayloader(&mut self, now: Instant) -> Result<(), AudioStreamError> {
-        while let Some(frame) = self.depayloader.poll_frame()? {
+        loop {
+            let frame = match self.depayloader.poll_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(AudioDepayloaderError::Crypto(error)) => {
+                    // The depayloader has consumed this sequence number. Never
+                    // forward unauthenticated/invalid plaintext, and never let
+                    // one damaged audio packet tear down video and controllers.
+                    if self
+                        .last_bad_packet_warning
+                        .is_none_or(|last| now - last >= Duration::from_secs(5))
+                    {
+                        warn!(%error, "discarding invalid encrypted audio packet; stream remains active");
+                        self.last_bad_packet_warning = Some(now);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             self.last_frame = now;
+            self.dropped_frames = false;
             self.events.push_back(AudioStreamEvent::OnFrame(AudioFrame {
                 timestamp: frame.timestamp,
                 buffer: frame.buffer.into(),
@@ -158,11 +183,11 @@ impl UdpStream for AudioStream {
     }
 
     fn poll_timeout(&self) -> Option<Instant> {
-        if !self.dropped_frames {
-            None
-        } else {
-            Some(self.last_frame + MAXIMUM_SAMPLE_WAIT)
-        }
+        self.ping_sender
+            .poll_timeout()
+            .into_iter()
+            .chain((!self.dropped_frames).then_some(self.last_frame + MAXIMUM_SAMPLE_WAIT))
+            .min()
     }
 
     fn poll_event(&mut self) -> Option<Self::Event> {
@@ -194,7 +219,7 @@ impl UdpStream for AudioStream {
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error> {
         self.ping_sender.handle_timeout(now);
 
-        if self.last_frame + MAXIMUM_SAMPLE_WAIT < now {
+        if self.last_frame + MAXIMUM_SAMPLE_WAIT <= now {
             if !self.dropped_frames {
                 debug!(
                     "Dropping audio frame because it took too long to receive: Last Frame: {:?}, Current Time: {:?}",

@@ -119,6 +119,135 @@ fn construct_data_packet(rtp_header: RtpAudioHeader, data: &[u8]) -> Vec<u8> {
     buffer
 }
 
+#[cfg(feature = "rustcrypto")]
+#[test]
+fn encrypted_audio_fec_survives_four_rollovers_with_loss() {
+    use crate::crypto::rustcrypto::RustCryptoBackend;
+    let key = AesKey([0x42; 16]);
+    let iv = AesIv(123);
+    let mut source = AudioPayloader::new(
+        AudioPayloaderConfig {
+            fec: true,
+            frame_len: 32,
+            encryption: Some((key, iv)),
+        },
+        RustCryptoBackend,
+    );
+    let mut receiver = AudioDepayloader::new(
+        AudioDepayloaderConfig {
+            fec: true,
+            encryption: Some(SunshineEncryption {
+                aes_key: key,
+                aes_iv: iv,
+            }),
+        },
+        Arc::new(RustCryptoBackend),
+    );
+    let mut received = 0u32;
+    for n in 0..(4 * 65536 + 8) {
+        let mut payload = [0x55; 32];
+        payload[..4].copy_from_slice(&u32::to_be_bytes(n));
+        source.push_frame(n * 5, &payload).unwrap();
+        while let Some(packet) = source.poll_packet().unwrap() {
+            // Lose the final original in each cycle; the two parity packets
+            // must reconstruct it without mixing it with another RTP cycle.
+            if packet[1] == RTP_PAYLOAD_TYPE_AUDIO && (n as u16) == 65535 {
+                continue;
+            }
+            receiver.handle_packet(packet).unwrap();
+            while let Some(frame) = receiver.poll_frame().unwrap() {
+                assert_eq!(&frame.buffer[..4], &received.to_be_bytes());
+                assert_eq!(
+                    frame.timestamp,
+                    Duration::from_millis(u64::from(received) * 5)
+                );
+                received += 1;
+            }
+        }
+    }
+    assert_eq!(received, 4 * 65536 + 8);
+}
+
+#[test]
+fn audio_loss_after_sequence_wrap_must_not_replay_previous_cycle() {
+    let mut depayloader = AudioDepayloader::new(
+        AudioDepayloaderConfig {
+            fec: false,
+            encryption: None,
+        },
+        Arc::new(DisabledCryptoBackend),
+    );
+    let packet = |n: u32| {
+        construct_data_packet(
+            RtpAudioHeader {
+                header: RTP_AUDIO_HEADER,
+                packet_type: RTP_PAYLOAD_TYPE_AUDIO,
+                sequence_number: n as u16,
+                timestamp: n * 5,
+                ssrc: 0,
+            },
+            &[1, 2, 3],
+        )
+    };
+    for n in 0..=65535u32 {
+        depayloader.handle_packet(&packet(n)).unwrap();
+        assert_eq!(
+            depayloader.poll_frame().unwrap().unwrap().timestamp,
+            Duration::from_millis(n as u64 * 5)
+        );
+    }
+    // The first packet of the next cycle is lost; skip to sequence 1.
+    depayloader.handle_packet(&packet(65537)).unwrap();
+    depayloader.try_skip_samples().unwrap();
+    assert_eq!(
+        depayloader.poll_frame().unwrap().unwrap().timestamp,
+        Duration::from_millis(65537 * 5)
+    );
+    assert!(depayloader.poll_frame().unwrap().is_none());
+    depayloader.try_skip_samples().unwrap();
+    assert!(
+        depayloader.poll_frame().unwrap().is_none(),
+        "must not jump backward to retained FEC history from the previous cycle"
+    );
+}
+
+#[test]
+fn audio_reordering_across_sequence_wrap_keeps_the_future_packet() {
+    let mut depayloader = AudioDepayloader::new(
+        AudioDepayloaderConfig {
+            fec: false,
+            encryption: None,
+        },
+        Arc::new(DisabledCryptoBackend),
+    );
+    let packet = |n: u32| {
+        construct_data_packet(
+            RtpAudioHeader {
+                header: RTP_AUDIO_HEADER,
+                packet_type: RTP_PAYLOAD_TYPE_AUDIO,
+                sequence_number: n as u16,
+                timestamp: n * 5,
+                ssrc: 0,
+            },
+            &[1, 2, 3],
+        )
+    };
+    for n in 0..65535u32 {
+        depayloader.handle_packet(&packet(n)).unwrap();
+        assert!(depayloader.poll_frame().unwrap().is_some());
+    }
+    depayloader.handle_packet(&packet(65536)).unwrap();
+    depayloader.handle_packet(&packet(65535)).unwrap();
+    assert_eq!(
+        depayloader.poll_frame().unwrap().unwrap().timestamp,
+        Duration::from_millis(65535 * 5)
+    );
+    assert_eq!(
+        depayloader.poll_frame().unwrap().unwrap().timestamp,
+        Duration::from_millis(65536 * 5)
+    );
+}
+
 fn construct_fec_packet(
     rtp_header: RtpAudioHeader,
     fec_header: AudioFecHeader,

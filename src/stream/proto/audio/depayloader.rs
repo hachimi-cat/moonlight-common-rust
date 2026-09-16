@@ -121,16 +121,19 @@ impl AudioDepayloader {
         // The minimum sequence number that we need to store for fec reconstruction
         let minimum_sequence_number = self
             .current_sequence_number
-            .saturating_sub(RTP_AUDIO_DATA_SHARDS as u16);
+            .wrapping_sub(RTP_AUDIO_DATA_SHARDS as u16);
 
-        self.data_packets
-            .retain(|sequence_number, _| *sequence_number >= minimum_sequence_number);
+        self.data_packets.retain(|sequence_number, _| {
+            sequence_number.wrapping_sub(minimum_sequence_number) < 32768
+        });
 
-        while self
-            .fec_packets
-            .pop_front_if(|packet| packet.header.base_sequence_number < minimum_sequence_number)
-            .is_some()
-        {}
+        self.fec_packets.retain(|packet| {
+            packet
+                .header
+                .base_sequence_number
+                .wrapping_sub(minimum_sequence_number)
+                < 32768
+        });
 
         // -- Decrypt data if necessary
         if let Some(output) = output.as_mut()
@@ -169,7 +172,12 @@ impl AudioDepayloader {
         let Some((next_data_sequence_number, _)) = self
             .data_packets
             .iter()
-            .find(|(sequence_number, _)| **sequence_number >= self.current_sequence_number)
+            .filter(|(sequence_number, _)| {
+                sequence_number.wrapping_sub(self.current_sequence_number) < 32768
+            })
+            .min_by_key(|(sequence_number, _)| {
+                sequence_number.wrapping_sub(self.current_sequence_number)
+            })
         else {
             // We can't do anything without at least 2 data packets
             return Ok(());
@@ -335,7 +343,11 @@ impl AudioDepayloader {
 
         // -- Handle packet
         if rtp_header.packet_type == RTP_PAYLOAD_TYPE_AUDIO {
-            if rtp_header.sequence_number < self.current_sequence_number {
+            if rtp_header
+                .sequence_number
+                .wrapping_sub(self.current_sequence_number)
+                >= 32768
+            {
                 // Drop the packet because it is too old
                 return Ok(());
             }
@@ -350,13 +362,10 @@ impl AudioDepayloader {
 
             // Maybe this is a late data packet -> try fec recovery
             let fec_packet = self.fec_packets.iter().find(|packet| {
-                let sequence_number_range = packet.header.base_sequence_number
-                    ..(packet
-                        .header
-                        .base_sequence_number
-                        .saturating_add(RTP_AUDIO_DATA_SHARDS as u16));
-
-                sequence_number_range.contains(&rtp_header.sequence_number)
+                rtp_header
+                    .sequence_number
+                    .wrapping_sub(packet.header.base_sequence_number)
+                    < RTP_AUDIO_DATA_SHARDS as u16
             });
             if let Some(packet) = fec_packet {
                 self.try_reconstruct_fec_block(packet.header.base_sequence_number)?;
@@ -398,8 +407,10 @@ impl AudioDepayloader {
             }
 
             let base_sequence_number = fec_header.base_sequence_number;
-            if self.current_sequence_number
-                > (base_sequence_number.saturating_add(RTP_AUDIO_TOTAL_SHARDS as u16))
+            if base_sequence_number
+                .wrapping_add(RTP_AUDIO_TOTAL_SHARDS as u16)
+                .wrapping_sub(self.current_sequence_number)
+                >= 32768
             {
                 // Drop the packet because it is too old
                 return Ok(());
