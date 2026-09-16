@@ -191,7 +191,7 @@ impl MoonlightStream {
         }
 
         debug!("binding all streams");
-        let (audio_stream, video_stream, mut control_stream, foundation_mic_stream) = try_join!(
+        let (mut audio_stream, video_stream, mut control_stream, foundation_mic_stream) = try_join!(
             StreamDriver::new(audio_stream.expect("audio stream")),
             StreamDriver::new(video_stream.expect("video stream")),
             StreamDriver::new(control_stream.expect("control stream")),
@@ -225,6 +225,14 @@ impl MoonlightStream {
                 },
             }
         }
+
+        // Apollo/Sunshine's recvThread uses one mutable sender endpoint for
+        // outstanding audio AND video async receives. Concurrent initial
+        // pings can bind one stream to the other stream's UDP port forever.
+        // Complete audio discovery before polling the video driver's first
+        // ping. Wait for actual media, not a guessed sleep; no host change is
+        // required. This initial frame precedes browser media negotiation.
+        initialize_audio_stream(&mut audio_stream).await?;
 
         Ok(Self {
             host_features,
@@ -298,5 +306,66 @@ impl MoonlightStream {
 
     pub fn host_features(&self) -> HostFeatures {
         self.host_features.clone()
+    }
+}
+
+async fn initialize_audio_stream(
+    audio_stream: &mut StreamDriver<AudioStream>,
+) -> Result<(), MoonlightStreamError> {
+    info!("establishing audio endpoint before starting video discovery");
+    tokio::time::timeout(Duration::from_secs(5), audio_stream.drive())
+        .await
+        .map_err(|_| MoonlightStreamError::ConnectionTimeout)??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::stream::proto::audio::AudioStreamConfig;
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn audio_discovery_must_wait_for_a_host_packet_before_video_can_start() {
+        let host = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio = AudioStream::new_unencrypted(
+            SansInstant::from_nanos(0),
+            AudioStreamConfig {
+                addr: host.local_addr().unwrap(),
+                opus_config: OpusMultistreamConfig::STEREO,
+                fec: false,
+                sunshine_ping: None,
+                sunshine_encryption: None,
+            },
+        );
+        let mut audio = StreamDriver::new(audio).await.unwrap();
+        let mut pending = Box::pin(initialize_audio_stream(&mut audio));
+        let mut ping = [0; 64];
+        let (result, received) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(25), &mut pending),
+            tokio::time::timeout(Duration::from_secs(1), host.recv_from(&mut ping)),
+        );
+        assert!(
+            result.is_err(),
+            "sending a ping alone must not release video discovery"
+        );
+        let (len, peer) = received.unwrap().unwrap();
+        assert_eq!(&ping[..len], b"PING");
+        let mut packet = vec![0x80, 97, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        packet.extend([1, 2, 3]);
+        host.send_to(&packet, peer).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(200), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        // Discovery consumes only its startup sample, not future audio.
+        packet[3] = 1;
+        host.send_to(&packet, peer).await.unwrap();
+        let AudioStreamEvent::OnFrame(frame) =
+            tokio::time::timeout(Duration::from_millis(200), audio.drive())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(frame.buffer.as_ref(), &[1, 2, 3]);
     }
 }
