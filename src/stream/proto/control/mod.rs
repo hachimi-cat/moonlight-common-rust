@@ -48,6 +48,10 @@ pub mod peer;
 #[allow(clippy::unwrap_used)]
 mod test;
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod lifecycle_test;
+
 /// References:
 /// - https://github.com/moonlight-stream/moonlight-common-c/blob/7b026e77be62175104640e7e722b758df6d3d0d7/src/InputStream.c#L39-L44
 const BATCH_INTERVAL_MS: Duration = Duration::from_millis(1);
@@ -324,13 +328,6 @@ impl ControlStream {
         if self.peer_connected {
             debug_assert_eq!(self.buffered_packets.len(), 0);
         }
-        if self.host.can_discard() {
-            trace!("erroring with NotConnected because the host can be discarded");
-            // This only happens when there's no peer in the connection
-            // -> we must've disconnected somehow -> this object is not useable anymore
-            return Err(ControlError::NotConnected);
-        }
-
         // Handle events
         while let Some(event) = self.host.poll_event() {
             trace!(event = ?event, "control host event");
@@ -407,6 +404,22 @@ impl ControlStream {
 
             trace!("pushing event");
             self.events.push_back(event);
+        }
+
+        // ENet removes the last peer before publishing its Disconnect event.
+        // Drain that event first: returning NotConnected above the event loop
+        // hid it from callers and aborted the browser's timeout pump before
+        // its reconnect handler could run. Deliver the queued terminal event
+        // successfully once, then report NotConnected on later updates.
+        if self.host.can_discard() {
+            if self
+                .events
+                .iter()
+                .any(|event| matches!(event, ControlStreamEvent::Disconnect))
+            {
+                return Ok(());
+            }
+            return Err(ControlError::NotConnected);
         }
 
         // Handle batching
