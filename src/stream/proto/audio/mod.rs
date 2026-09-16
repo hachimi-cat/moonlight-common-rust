@@ -74,6 +74,8 @@ pub struct AudioStream {
     last_frame: Instant,
     dropped_frames: bool,
     last_bad_packet_warning: Option<Instant>,
+    received_first_packet: bool,
+    received_first_frame: bool,
     ping_sender: PingSender,
     depayloader: AudioDepayloader,
     events: VecDeque<AudioStreamEvent>,
@@ -93,6 +95,8 @@ impl AudioStream {
             last_frame: now,
             dropped_frames: false,
             last_bad_packet_warning: None,
+            received_first_packet: false,
+            received_first_frame: false,
             ping_sender: PingSender::new(
                 now,
                 PingSenderConfig {
@@ -132,6 +136,10 @@ impl AudioStream {
                 Err(error) => return Err(error.into()),
             };
             self.last_frame = now;
+            if !self.received_first_frame {
+                info!("received first decoded audio packet");
+                self.received_first_frame = true;
+            }
             self.dropped_frames = false;
             self.events.push_back(AudioStreamEvent::OnFrame(AudioFrame {
                 timestamp: frame.timestamp,
@@ -205,6 +213,14 @@ impl UdpStream for AudioStream {
             return Ok(());
         }
 
+        if !self.received_first_packet {
+            info!(
+                bytes = data.len(),
+                sequence = data.get(2..4).map(|v| u16::from_be_bytes([v[0], v[1]])),
+                "received first audio datagram"
+            );
+            self.received_first_packet = true;
+        }
         self.depayloader.handle_packet(data)?;
 
         if !matches!(self.ping_sender.state(), PingSenderState::Finished) {
