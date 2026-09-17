@@ -300,7 +300,7 @@ impl InputBatcher {
                     return Default::default();
                 };
 
-                if self.gamepads.contains(controller) {
+                if !self.gamepads.contains(controller) {
                     warn!(
                         controller_number = controller_number,
                         "received controller disconnect event for a controller that was not connected! dropping the packet."
@@ -449,5 +449,65 @@ impl InputBatcher {
         }
 
         packets.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connected_controller_can_disconnect() {
+        let mut batcher = InputBatcher::default();
+
+        let connected = batcher
+            .batch_input(ClientInputEvent::ControllerConnect {
+                controller_number: 0,
+                ty: ControllerType::Unknown,
+                capabilities: ControllerCapabilities::empty(),
+                supported_buttons: ControllerButtons::empty(),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            connected.as_slice(),
+            [ControlPacket::ControllerArrival { .. }]
+        ));
+
+        let disconnected = batcher
+            .batch_input(ClientInputEvent::ControllerDisconnect {
+                controller_number: 0,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            disconnected.as_slice(),
+            [ControlPacket::ControllerState {
+                active_gamepad_mask,
+                controller_number: 0,
+                ..
+            }] if active_gamepad_mask.is_empty()
+        ));
+    }
+
+    #[test]
+    fn controller_numbers_are_local_to_each_control_stream() {
+        for _ in 0..3 {
+            let mut batcher = InputBatcher::default();
+            let packets = batcher
+                .batch_input(ClientInputEvent::ControllerConnect {
+                    controller_number: 0,
+                    ty: ControllerType::Unknown,
+                    capabilities: ControllerCapabilities::empty(),
+                    supported_buttons: ControllerButtons::empty(),
+                })
+                .collect::<Vec<_>>();
+
+            assert!(matches!(
+                packets.as_slice(),
+                [ControlPacket::ControllerArrival {
+                    controller_number: 0,
+                    ..
+                }]
+            ));
+        }
     }
 }
